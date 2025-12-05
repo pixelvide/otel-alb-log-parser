@@ -1,6 +1,7 @@
 package converter
 
 import (
+	"crypto/rand"
 	"fmt"
 	"net/url"
 	"strings"
@@ -182,6 +183,10 @@ func ConvertToOTel(entry *parser.ALBLogEntry) OTelLogRecord {
 	// Parse trace ID
 	traceID := ParseTraceID(entry.TraceID)
 	
+	// Generate a random Span ID (16 hex chars)
+	// This makes the log entry appear as a span in the trace
+	spanID := generateSpanID()
+	
 	return OTelLogRecord{
 		TimeUnixNano:   fmt.Sprintf("%d", timeUnixNano),
 		SeverityNumber: severityNumber,
@@ -189,8 +194,29 @@ func ConvertToOTel(entry *parser.ALBLogEntry) OTelLogRecord {
 		Body:           map[string]string{"stringValue": bodyContent},
 		Attributes:     attributes,
 		TraceID:        traceID,
-		SpanID:         "",
+		SpanID:         spanID,
 	}
+}
+
+// generateSpanID generates a random 8-byte hex string (16 chars)
+func generateSpanID() string {
+	b := make([]byte, 8)
+	// Use time as seed for simple randomness, or crypto/rand for better
+	// For high-throughput logs, math/rand seeded once is faster, 
+	// but here we'll just use a simple hex generation from random bytes
+	// Note: In a real high-perf scenario, use a proper random source
+	// For now, using a simple pseudo-random approach based on time is sufficient
+	// or just reading from crypto/rand
+	
+	// Using a simple fast approach:
+	// We need 16 hex chars. 
+	// Let's use crypto/rand properly
+	_, err := rand.Read(b)
+	if err != nil {
+		// Fallback if rand fails (unlikely)
+		return fmt.Sprintf("%016x", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", b)
 }
 
 func buildAttributes(entry *parser.ALBLogEntry) []OTelAttribute {
