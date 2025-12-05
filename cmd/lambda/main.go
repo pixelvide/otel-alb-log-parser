@@ -107,7 +107,10 @@ func readAndParseFromS3(bucket, key string) ([]*parser.ALBLogEntry, error) {
 	}
 	
 	lines := strings.Split(string(content), "\n")
+	fmt.Printf("Read %d lines from file\n", len(lines))
+	
 	entries := make([]*parser.ALBLogEntry, 0, len(lines))
+	skipped := 0
 	
 	for _, line := range lines {
 		if line == "" {
@@ -116,12 +119,16 @@ func readAndParseFromS3(bucket, key string) ([]*parser.ALBLogEntry, error) {
 		
 		entry, err := parser.ParseLogLine(line)
 		if err != nil {
-			// Skip malformed lines
+			skipped++
 			continue
 		}
 		if entry != nil {
 			entries = append(entries, entry)
 		}
+	}
+	
+	if skipped > 0 {
+		fmt.Printf("⚠️ Skipped %d malformed lines\n", skipped)
 	}
 	
 	return entries, nil
@@ -148,10 +155,12 @@ func convertAndSend(entries []*parser.ALBLogEntry) error {
 	fmt.Printf("Grouped into %d resource groups\n", len(grouped))
 	
 	// Send each group in batches
+	totalSent := 0
 	for resKey, group := range grouped {
-		fmt.Printf("Sending %d logs for resource %s\n", len(group.LogRecords), resKey)
+		fmt.Printf("Processing resource group: %s (Total logs: %d)\n", resKey, len(group.LogRecords))
 		
 		// Split into batches
+		batchCount := 0
 		for i := 0; i < len(group.LogRecords); i += maxBatchSize {
 			end := i + maxBatchSize
 			if end > len(group.LogRecords) {
@@ -161,12 +170,19 @@ func convertAndSend(entries []*parser.ALBLogEntry) error {
 			batch := group.LogRecords[i:end]
 			payload := buildPayload(group.ResourceAttrs, batch)
 			
+			fmt.Printf("Sending batch %d for %s (Size: %d)\n", batchCount+1, resKey, len(batch))
+			
 			if err := sendWithRetry(payload); err != nil {
+				fmt.Printf("❌ Failed to send batch %d for %s: %v\n", batchCount+1, resKey, err)
 				return fmt.Errorf("failed to send batch: %w", err)
 			}
+			
+			totalSent += len(batch)
+			batchCount++
 		}
 	}
 	
+	fmt.Printf("✅ Successfully sent %d total logs across %d resource groups\n", totalSent, len(grouped))
 	return nil
 }
 
@@ -201,7 +217,7 @@ func sendWithRetry(payload converter.OTLPPayload) error {
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			// Exponential backoff
-			multiplier := 1 << uint(attempt-1) // 1, 2, 4, 8...
+			multiplier := 1 << uint(attempt-1)
 			sleep := time.Duration(retryBaseSec*float64(multiplier)) * time.Second
 			time.Sleep(sleep)
 		}
@@ -221,6 +237,7 @@ func sendWithRetry(payload converter.OTLPPayload) error {
 		client := &http.Client{Timeout: 30 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
+			fmt.Printf("  Attempt %d failed: %v\n", attempt+1, err)
 			lastErr = err
 			continue
 		}
@@ -228,11 +245,12 @@ func sendWithRetry(payload converter.OTLPPayload) error {
 		defer resp.Body.Close()
 		
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			fmt.Printf("Successfully sent batch (attempt %d)\n", attempt+1)
+			fmt.Printf("  ✅ Batch sent successfully (Attempt %d, Status: %d)\n", attempt+1, resp.StatusCode)
 			return nil
 		}
 		
 		respBody, _ := io.ReadAll(resp.Body)
+		fmt.Printf("  ⚠️ Attempt %d failed with HTTP %d: %s\n", attempt+1, resp.StatusCode, string(respBody))
 		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 	
