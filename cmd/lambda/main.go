@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
@@ -30,9 +32,14 @@ var (
 	maxBatchSize       int
 	maxRetries         int
 	retryBaseSec       float64
+	logger             *slog.Logger
 )
 
 func init() {
+	// Initialize structured logger (JSON format)
+	logger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
 	// Initialize AWS session
 	sess := session.Must(session.NewSession())
 	s3Client = s3.New(sess)
@@ -47,29 +54,32 @@ func init() {
 }
 
 func handler(ctx context.Context, s3Event events.S3Event) error {
+	logger.Info("Lambda triggered", "record_count", len(s3Event.Records))
+
 	for _, record := range s3Event.Records {
 		bucket := record.S3.Bucket.Name
 		key := record.S3.Object.Key
 		
-		fmt.Printf("Processing s3://%s/%s\n", bucket, key)
+		log := logger.With("bucket", bucket, "key", key)
+		log.Info("Processing S3 object")
 		
 		// Read and parse logs from S3
 		entries, err := readAndParseFromS3(bucket, key)
 		if err != nil {
-			fmt.Printf("Error processing %s: %v\n", key, err)
+			log.Error("Error processing S3 object", "error", err)
 			return err
 		}
 		
 		if len(entries) == 0 {
-			fmt.Printf("No entries found in %s\n", key)
+			log.Info("No entries found")
 			continue
 		}
 		
-		fmt.Printf("Parsed %d entries from %s\n", len(entries), key)
+		log.Info("Successfully parsed entries", "count", len(entries))
 		
 		// Convert and send to OTLP
 		if err := convertAndSend(entries); err != nil {
-			fmt.Printf("Error sending to OTLP: %v\n", err)
+			log.Error("Error sending to OTLP", "error", err)
 			return err
 		}
 	}
@@ -107,7 +117,7 @@ func readAndParseFromS3(bucket, key string) ([]*parser.ALBLogEntry, error) {
 	}
 	
 	lines := strings.Split(string(content), "\n")
-	fmt.Printf("Read %d lines from file\n", len(lines))
+	logger.Info("Read lines from file", "line_count", len(lines))
 	
 	entries := make([]*parser.ALBLogEntry, 0, len(lines))
 	skipped := 0
@@ -128,7 +138,7 @@ func readAndParseFromS3(bucket, key string) ([]*parser.ALBLogEntry, error) {
 	}
 	
 	if skipped > 0 {
-		fmt.Printf("⚠️ Skipped %d malformed lines\n", skipped)
+		logger.Warn("Skipped malformed lines", "skipped_count", skipped)
 	}
 	
 	return entries, nil
@@ -152,16 +162,34 @@ func convertAndSend(entries []*parser.ALBLogEntry) error {
 		grouped[resKey].LogRecords = append(grouped[resKey].LogRecords, logRecord)
 	}
 	
-	fmt.Printf("Grouped into %d resource groups\n", len(grouped))
+	logger.Info("Grouped logs", "resource_group_count", len(grouped))
 	
-	// Send each group in batches
+	logger.Info("Grouped logs", "resource_group_count", len(grouped))
+	
+	// Concurrency control
+	maxConcurrent := 10
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+	errChan := make(chan error, 1)
+	
 	totalSent := 0
+	var sentLock sync.Mutex
+
+	// Send each group in batches
 	for resKey, group := range grouped {
-		fmt.Printf("Processing resource group: %s (Total logs: %d)\n", resKey, len(group.LogRecords))
+		groupLog := logger.With("resource_key", resKey, "total_logs", len(group.LogRecords))
+		groupLog.Info("Processing resource group")
 		
 		// Split into batches
 		batchCount := 0
 		for i := 0; i < len(group.LogRecords); i += maxBatchSize {
+			// Check for previous errors
+			select {
+			case err := <-errChan:
+				return err
+			default:
+			}
+
 			end := i + maxBatchSize
 			if end > len(group.LogRecords) {
 				end = len(group.LogRecords)
@@ -169,20 +197,49 @@ func convertAndSend(entries []*parser.ALBLogEntry) error {
 			
 			batch := group.LogRecords[i:end]
 			payload := buildPayload(group.ResourceAttrs, batch)
+			currentBatchCount := batchCount + 1
+			currentBatchSize := len(batch)
 			
-			fmt.Printf("Sending batch %d for %s (Size: %d)\n", batchCount+1, resKey, len(batch))
+			wg.Add(1)
+			go func(p converter.OTLPPayload, bID int, bSize int, log *slog.Logger) {
+				defer wg.Done()
+				
+				// Acquire semaphore
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				
+				log.Info("Sending batch", "batch_id", bID, "batch_size", bSize)
+				
+				if err := sendWithRetry(p); err != nil {
+					log.Error("Failed to send batch", "batch_id", bID, "error", err)
+					// Try to report error (non-blocking)
+					select {
+					case errChan <- fmt.Errorf("failed to send batch %d: %w", bID, err):
+					default:
+					}
+					return
+				}
+				
+				sentLock.Lock()
+				totalSent += bSize
+				sentLock.Unlock()
+			}(payload, currentBatchCount, currentBatchSize, groupLog)
 			
-			if err := sendWithRetry(payload); err != nil {
-				fmt.Printf("❌ Failed to send batch %d for %s: %v\n", batchCount+1, resKey, err)
-				return fmt.Errorf("failed to send batch: %w", err)
-			}
-			
-			totalSent += len(batch)
 			batchCount++
 		}
 	}
 	
-	fmt.Printf("✅ Successfully sent %d total logs across %d resource groups\n", totalSent, len(grouped))
+	// Wait for all batches to complete
+	wg.Wait()
+	
+	// Check for any errors that occurred
+	select {
+	case err := <-errChan:
+		return err
+	default:
+	}
+	
+	logger.Info("Successfully sent all logs", "total_sent", totalSent, "resource_groups", len(grouped))
 	return nil
 }
 
@@ -237,7 +294,7 @@ func sendWithRetry(payload converter.OTLPPayload) error {
 		client := &http.Client{Timeout: 30 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			fmt.Printf("  Attempt %d failed: %v\n", attempt+1, err)
+			logger.Warn("Batch send attempt failed", "attempt", attempt+1, "error", err)
 			lastErr = err
 			continue
 		}
@@ -245,12 +302,12 @@ func sendWithRetry(payload converter.OTLPPayload) error {
 		defer resp.Body.Close()
 		
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			fmt.Printf("  ✅ Batch sent successfully (Attempt %d, Status: %d)\n", attempt+1, resp.StatusCode)
+			logger.Info("Batch sent successfully", "attempt", attempt+1, "status", resp.StatusCode)
 			return nil
 		}
 		
 		respBody, _ := io.ReadAll(resp.Body)
-		fmt.Printf("  ⚠️ Attempt %d failed with HTTP %d: %s\n", attempt+1, resp.StatusCode, string(respBody))
+		logger.Warn("Batch send attempt failed", "attempt", attempt+1, "status", resp.StatusCode, "response", string(respBody))
 		lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 	
