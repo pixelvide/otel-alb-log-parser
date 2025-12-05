@@ -47,12 +47,12 @@ aws ecr get-login-password --region ap-south-1 | \
   <account-id>.dkr.ecr.ap-south-1.amazonaws.com
 
 # Build for ARM64 (Graviton2 - cheaper and faster)
-docker buildx build --platform linux/arm64 \
+docker buildx build --platform linux/arm64 --provenance=false \
   -t <account-id>.dkr.ecr.ap-south-1.amazonaws.com/alb-processor:latest \
   --push .
 
 # Or build for AMD64
-docker buildx build --platform linux/amd64 \
+docker buildx build --platform linux/amd64 --provenance=false \
   -t <account-id>.dkr.ecr.ap-south-1.amazonaws.com/alb-processor:latest \
   --push .
 ```
@@ -104,7 +104,7 @@ aws s3api put-bucket-notification-configuration \
 ### 5. Update Function
 ```bash
 # Rebuild and push new image
-docker buildx build --platform linux/arm64 \
+docker buildx build --platform linux/arm64 --provenance=false \
   -t <account-id>.dkr.ecr.ap-south-1.amazonaws.com/alb-processor:latest \
   --push .
 

@@ -34,7 +34,7 @@ run-convert:
 
 # Build Docker image
 docker-build:
-	@docker build --no-cache -t alb-processor:latest .
+	@docker build --provenance=false --no-cache -t alb-processor:latest .
 
 # Build Lambda deployment package
 lambda-package: build
